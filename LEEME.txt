@@ -1,0 +1,44 @@
+SEÑOR MEYBI — versión para Vercel
+=================================
+
+QUÉ LLEVA ESTA VERSIÓN
+----------------------
+- Sin límite de jugadores en los dos modos (mínimo 3).
+- Mazo forjado en el propio dispositivo al abrir la página: cartas nuevas en
+  cada sesión, sin repetir ninguna dentro de la partida.
+- Señor Meybi comentarista y juez, sin servicios externos.
+- Ceremonia de premios finales: Señor Meybi entrega dos puntos extra en
+  escena, paso a paso, replicada en el móvil de cada jugador.
+- Sala con dos pestañas: crear partida o unirse con código.
+- Botón de pantalla completa y anfitrión que juega desde el tablero.
+- No consume créditos ni tokens: todo es código local.
+
+CÓMO SUBIRLO SOBRE EL PROYECTO QUE YA TIENES
+--------------------------------------------
+1. Descomprime esta carpeta.
+2. Entra en vercel.com y abre TU PROYECTO (no la pantalla de inicio de
+   Vercel: desde ahí se crean proyectos nuevos).
+3. Pestaña Deployments → crear un despliegue nuevo.
+4. Arrastra la carpeta COMPLETA. Las imágenes y los sonidos están en art/:
+   si solo subes el index.html, el juego se ve sin arte y sin música.
+5. Framework Preset: Other. Deja los campos de build vacíos.
+6. Publica. Si no pasa a producción solo, pulsa Promote to Production.
+
+VOLVER ATRÁS
+------------
+Los despliegues anteriores siguen accesibles en Deployments. Si algo se
+rompe, abre el anterior y pulsa Promote to Production.
+
+COMPROBACIÓN
+------------
+Abre tu-proyecto.vercel.app/art/logo.png
+Si ves el logo, subió todo. Si da 404, faltó la carpeta art/.
+
+NOTAS
+-----
+- Para jugar cada uno con su móvil, todos los dispositivos deben estar en la
+  misma red wifi.
+- El audio empieza al primer toque en pantalla: los navegadores móviles no
+  permiten reproducir sonido antes.
+- Añade el juego a la pantalla de inicio del móvil para jugar sin la barra
+  del navegador.
