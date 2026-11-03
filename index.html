@@ -1162,6 +1162,7 @@ class Component extends DCLogic {
       document.removeEventListener("webkitfullscreenchange", this.onFsChange);
     }
     this.stopTimer();
+    if (this._pushTimer) { clearTimeout(this._pushTimer); this._pushTimer = null; }
     if (this.link) { try { this.link.close(); } catch (e) {} this.link = null; }
     if (this.onResize) window.removeEventListener("resize", this.onResize);
     this.clearBotTimers();
@@ -1224,9 +1225,13 @@ class Component extends DCLogic {
     const code = this.state.roomCode || this.net.makeCode();
     this.setState({ roomCode: code, netStatus: "connecting", netNotice: "" });
     try {
+      this._sentPhotos = new Map();
+      this._catchUp = new Set();
+      this._lastPush = null;
       this.link = await this.net.hostRoom(code, {
         onOpen: () => { this.setState({ netStatus: "open" }); this.drawLobbyQr(); },
         onError: () => this.setState({ netStatus: "error" }),
+        onStatus: (st) => this.setState({ netStatus: st }),
         onMessage: (msg) => this.handleGuestMessage(msg),
         onLeave: (playerId) => this.handleGuestLeave(playerId),
       });
@@ -1249,6 +1254,7 @@ class Component extends DCLogic {
         outOfRound: false,
       };
       const rejoining = at >= 0 && players[at].connected === false;
+      (this._catchUp || (this._catchUp = new Set())).add(incoming.id);
       if (at >= 0) players[at] = { ...players[at], ...record };
       else players.push(record);
       this.setState({
@@ -1560,18 +1566,66 @@ class Component extends DCLogic {
           }
         : null,
       players: s.players.map((p) => ({
-        id: p.id, name: p.name, photo: p.photo, score: p.score,
+        id: p.id, name: p.name, score: p.score,
         connected: !!p.connected, outOfRound: !!p.outOfRound,
       })),
     };
   }
 
+  // Varios cambios seguidos (temporizador, taps, giro de la ruleta) se agrupan:
+  // solo se envía el último estado como mucho cada 150 ms.
   pushState() {
     if (this.state.role !== "HOST" || !this.link) return;
-    const json = JSON.stringify(this.netState());
+    if (this._pushTimer) return;
+    const wait = Math.max(0, 150 - (Date.now() - (this._lastPushAt || 0)));
+    this._pushTimer = setTimeout(() => {
+      this._pushTimer = null;
+      this.flushState();
+    }, wait);
+  }
+
+  flushState() {
+    if (this.state.role !== "HOST" || !this.link) return;
+    this._lastPushAt = Date.now();
+    this.sendPhotos();
+    const net = this.netState();
+    const json = JSON.stringify(net);
     if (json === this._lastPush) return;
     this._lastPush = json;
-    this.link.broadcast(JSON.parse(json));
+    this.link.broadcast(net);
+  }
+
+  // Las fotos (data URL, pesan decenas de KB) se envían una sola vez por jugador,
+  // y completas a quien acaba de entrar o reconectar.
+  sendPhotos() {
+    const sent = this._sentPhotos || (this._sentPhotos = new Map());
+    const fresh = {};
+    let anyFresh = false;
+    for (const p of this.state.players) {
+      if (p.photo && sent.get(p.id) !== p.photo) {
+        fresh[p.id] = p.photo;
+        sent.set(p.id, p.photo);
+        anyFresh = true;
+      }
+    }
+    if (anyFresh) this.link.broadcastRaw({ type: "photos", photos: fresh });
+    const joiners = this._catchUp;
+    if (joiners && joiners.size) {
+      const all = {};
+      for (const p of this.state.players) if (p.photo) all[p.id] = p.photo;
+      joiners.forEach((id) => this.link.sendTo(id, { type: "photos", photos: all }));
+      joiners.clear();
+    }
+  }
+
+  // Pega en el estado de un móvil las fotos recibidas por separado.
+  withPhotos(state) {
+    if (!state || !Array.isArray(state.players)) return state;
+    const cache = this.photoCache || {};
+    return {
+      ...state,
+      players: state.players.map((p) => (p.photo ? p : { ...p, photo: cache[p.id] || null })),
+    };
   }
 
   // ---- multi-device: phone side ----
@@ -1613,9 +1667,14 @@ class Component extends DCLogic {
     try {
       this.link = await this.net.joinRoom(code, { id: this.myPlayerId, name, photo: this.state.phonePhoto }, {
         onMessage: (msg) => {
+          if (msg.type === "photos") {
+            this.photoCache = { ...(this.photoCache || {}), ...(msg.photos || {}) };
+            if (this.state.phoneState) this.setState({ phoneState: this.withPhotos(this.state.phoneState) });
+            return;
+          }
           if (msg.type !== "state") return;
           const prev = this.state.phoneState;
-          const next = msg.state;
+          const next = this.withPhotos(msg.state);
           const newRound = !prev || prev.roundNumber !== next.roundNumber
             || (next.phase === "THINKING" && prev.phase !== "THINKING")
             || (next.spinning && !prev.spinning);
@@ -1624,6 +1683,7 @@ class Component extends DCLogic {
           if (next.phase !== "JUDGING" && next.phase !== "LISTEN") this.setState({ phoneAlloc: {} });
           this.setState({ phoneState: next, phoneMyId: msg.you || this.myPlayerId, phoneLost: false });
         },
+        onReconnected: () => this.setState({ phoneLost: false }),
         onClose: () => this.setState({ phoneLost: true }),
       });
       this.setState({ phoneJoining: false, phoneJoined: true, roomCode: code, phoneMyId: this.myPlayerId });

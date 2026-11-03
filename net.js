@@ -28,28 +28,69 @@ function waitForPeer() {
   });
 }
 
+// The signalling broker can drop a peer at any time (idle sockets, network
+// blips). Direct phone<->host links survive that, but new phones can only find
+// the room while the host is registered again. This keeps the peer registered,
+// retrying with backoff until it succeeds or the room is closed.
+function keepBrokerAlive(peer, isClosed, onDown) {
+  let timer = null;
+  let tries = 0;
+  const arm = () => {
+    if (isClosed() || timer || peer.destroyed || !peer.disconnected) return;
+    if (onDown) onDown();
+    const wait = Math.min(1000 * 2 ** tries, 10000);
+    tries += 1;
+    timer = setTimeout(() => {
+      timer = null;
+      if (isClosed() || peer.destroyed || !peer.disconnected) return;
+      try { peer.reconnect(); } catch (e) { arm(); }
+    }, wait);
+  };
+  peer.on("disconnected", arm);
+  peer.on("error", arm);
+  peer.on("open", () => { tries = 0; });
+  return () => { if (timer) clearTimeout(timer); timer = null; };
+}
+
 // Host = the big screen. Owns the game state and broadcasts it to every phone.
 export async function hostRoom(code, handlers) {
   const Peer = await waitForPeer();
   const peer = new Peer(PREFIX + code, { debug: 0 });
   const conns = new Map();
   let closed = false;
+  let opened = false;
+  const stopBroker = keepBrokerAlive(peer, () => closed, () => {
+    if (!closed && handlers.onStatus) handlers.onStatus("connecting");
+  });
 
-  peer.on("open", () => { if (!closed && handlers.onOpen) handlers.onOpen(code); });
-  peer.on("error", (err) => { if (!closed && handlers.onError) handlers.onError(err); });
+  peer.on("open", () => {
+    opened = true;
+    if (!closed && handlers.onOpen) handlers.onOpen(code);
+  });
+  peer.on("error", (err) => {
+    // Once the room is up, broker errors are retried by keepBrokerAlive.
+    if (!closed && !opened && handlers.onError) handlers.onError(err);
+  });
 
   peer.on("connection", (conn) => {
     conn.on("data", (msg) => {
       if (!msg || typeof msg !== "object") return;
       if (msg.type === "join") {
         conn.playerId = msg.player && msg.player.id;
-        if (conn.playerId) conns.set(conn.playerId, conn);
+        if (conn.playerId) {
+          const old = conns.get(conn.playerId);
+          if (old && old !== conn) { try { old.close(); } catch (e) {} }
+          conns.set(conn.playerId, conn);
+        }
       }
       if (handlers.onMessage) handlers.onMessage(msg, conn);
     });
     const drop = () => {
-      if (conn.playerId && conns.get(conn.playerId) === conn) conns.delete(conn.playerId);
-      if (handlers.onLeave && conn.playerId) handlers.onLeave(conn.playerId);
+      // Only the phone's current link counts: an old link closing after the
+      // same player rejoined must not mark that player as gone.
+      const wasCurrent = !!conn.playerId && conns.get(conn.playerId) === conn;
+      if (wasCurrent) conns.delete(conn.playerId);
+      if (wasCurrent && handlers.onLeave) handlers.onLeave(conn.playerId);
     };
     conn.on("close", drop);
     conn.on("error", drop);
@@ -62,12 +103,17 @@ export async function hostRoom(code, handlers) {
         try { conn.send({ type: "state", you: playerId, state }); } catch (e) {}
       });
     },
+    // Sends the same payload to every connected phone (used for photos).
+    broadcastRaw(payload) {
+      conns.forEach((conn) => { try { conn.send(payload); } catch (e) {} });
+    },
     sendTo(playerId, payload) {
       const conn = conns.get(playerId);
       if (conn) { try { conn.send(payload); } catch (e) {} }
     },
     close() {
       closed = true;
+      stopBroker();
       conns.forEach((conn) => { try { conn.close(); } catch (e) {} });
       conns.clear();
       try { peer.destroy(); } catch (e) {}
@@ -75,43 +121,92 @@ export async function hostRoom(code, handlers) {
   };
 }
 
+// Resolves when the peer is registered with the broker again.
+function waitPeerOpen(peer) {
+  if (peer.open) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { peer.off("open", onOpen); reject(new Error("broker")); }, READY_TIMEOUT);
+    const onOpen = () => { clearTimeout(timer); resolve(); };
+    peer.once("open", onOpen);
+  });
+}
+
 // Phone = one player. Sends taps and point allocations, receives state.
+// If the link drops (screen off, network change), it reconnects with the same
+// player id, so the host puts the player back in the game.
 export async function joinRoom(code, player, handlers) {
   const Peer = await waitForPeer();
   const peer = new Peer(undefined, { debug: 0 });
-  let settled = false;
   let closed = false;
+  let reconnecting = false;
+  let conn = null;
+  const stopBroker = keepBrokerAlive(peer, () => closed);
 
   await new Promise((resolve, reject) => {
+    let settled = false;
     peer.on("open", () => { if (!settled) { settled = true; resolve(); } });
     peer.on("error", (err) => { if (!settled) { settled = true; reject(err); } });
   });
 
-  const conn = peer.connect(PREFIX + code, { reliable: true });
+  function openConnection() {
+    return new Promise((resolve, reject) => {
+      const c = peer.connect(PREFIX + code, { reliable: true });
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; try { c.close(); } catch (e) {} reject(new Error("timeout")); }
+      }, READY_TIMEOUT);
+      c.on("open", () => { if (!done) { done = true; clearTimeout(timer); resolve(c); } });
+      c.on("error", (err) => { if (!done) { done = true; clearTimeout(timer); reject(err); } });
+    });
+  }
 
-  await new Promise((resolve, reject) => {
-    let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; reject(new Error("timeout")); } }, READY_TIMEOUT);
-    conn.on("open", () => { if (!done) { done = true; clearTimeout(timer); resolve(); } });
-    conn.on("error", (err) => { if (!done) { done = true; clearTimeout(timer); reject(err); } });
-    peer.on("error", (err) => { if (!done) { done = true; clearTimeout(timer); reject(err); } });
-  });
+  function attach(c) {
+    conn = c;
+    let gone = false;
+    const lost = () => {
+      if (gone || closed || conn !== c) return;
+      gone = true;
+      reconnect();
+    };
+    c.on("data", (msg) => {
+      if (!closed && conn === c && msg && typeof msg === "object" && handlers.onMessage) handlers.onMessage(msg);
+    });
+    c.on("close", lost);
+    c.on("error", lost);
+    c.send({ type: "join", player });
+  }
 
-  conn.send({ type: "join", player });
+  async function reconnect() {
+    if (closed || reconnecting) return;
+    reconnecting = true;
+    if (handlers.onReconnecting) handlers.onReconnecting();
+    const MAX_ATTEMPTS = 8;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS && !closed; attempt++) {
+      await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 8000)));
+      if (closed) break;
+      try {
+        await waitPeerOpen(peer);
+        const c = await openConnection();
+        if (closed) { try { c.close(); } catch (e) {} break; }
+        attach(c);
+        reconnecting = false;
+        if (handlers.onReconnected) handlers.onReconnected();
+        return;
+      } catch (e) { /* try again */ }
+    }
+    reconnecting = false;
+    if (!closed && handlers.onClose) handlers.onClose();
+  }
 
-  conn.on("data", (msg) => {
-    if (!closed && msg && typeof msg === "object" && handlers.onMessage) handlers.onMessage(msg);
-  });
-  const drop = () => { if (!closed && handlers.onClose) handlers.onClose(); };
-  conn.on("close", drop);
-  peer.on("disconnected", drop);
+  attach(await openConnection());
 
   return {
     kind: "guest",
-    send(payload) { try { conn.send(payload); } catch (e) {} },
+    send(payload) { try { if (conn) conn.send(payload); } catch (e) {} },
     close() {
       closed = true;
-      try { conn.close(); } catch (e) {}
+      stopBroker();
+      try { if (conn) conn.close(); } catch (e) {}
       try { peer.destroy(); } catch (e) {}
     },
   };
